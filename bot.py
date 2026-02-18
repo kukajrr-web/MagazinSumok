@@ -386,6 +386,16 @@ def build_app():
         allow_reentry=True,
     )
 
+    def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    async def _startup(app):
+        await app.bot.delete_webhook(drop_pending_updates=True)
+
+    app.post_init = _startup
+
+    app.run_polling(drop_pending_updates=True)
+
     # ВАЖНО: ConversationHandler должен быть ДО общего CallbackQueryHandler, но мы уже добавили общий.
     # Поэтому пересоберём порядок: удалим общий и добавим правильно.
     # (В python-telegram-bot порядок важен.)
@@ -396,5 +406,6 @@ def build_app():
 
 
 if __name__ == "__main__":
+    await app.bot.delete_webhook(drop_pending_updates=True)
     application = build_app()
     application.run_polling()
