@@ -376,12 +376,14 @@ def build_app() -> Application:
     price_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(entry_price, pattern="^price$")],
         states={
-            WAIT_MODEL_OR_PHOTO: [
-                MessageHandler(filters.TEXT | filters.PHOTO, on_model_or_photo),
-                CallbackQueryHandler(on_menu_click, pattern="^(catalog|back|item:.*|order:.*|delivery|manager)$"),
-            ],
-            WAIT_CITY: [MessageHandler(filters.TEXT, on_city)],
-            WAIT_PHONE: [MessageHandler(filters.TEXT, on_phone)],
+         WAIT_MODEL_OR_PHOTO: [
+    MessageHandler(filters.PHOTO, on_model_or_photo),
+    MessageHandler(filters.TEXT & ~filters.COMMAND, on_model_or_photo),
+],
+
+        WAIT_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_city)],
+        WAIT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_phone)],
+
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
