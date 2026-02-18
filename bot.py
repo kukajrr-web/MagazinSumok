@@ -409,6 +409,6 @@ def main():
 
 
 if __name__ == "__main__":
-    await app.bot.delete_webhook(drop_pending_updates=True)
     application = build_app()
+    await app.bot.delete_webhook(drop_pending_updates=True)
     application.run_polling()
