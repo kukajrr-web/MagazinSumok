@@ -386,7 +386,7 @@ def build_app():
         allow_reentry=True,
     )
 
-    def main():
+def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     async def _startup(app):
