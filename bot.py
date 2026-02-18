@@ -394,7 +394,10 @@ def build_app():
 
     app.post_init = _startup
 
+    app.add_handler(conv)
+
     app.run_polling(drop_pending_updates=True)
+
 
     # ВАЖНО: ConversationHandler должен быть ДО общего CallbackQueryHandler, но мы уже добавили общий.
     # Поэтому пересоберём порядок: удалим общий и добавим правильно.
