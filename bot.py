@@ -6,7 +6,6 @@ import base64
 import logging
 from dataclasses import dataclass
 from typing import Dict, Any, Optional, List, Tuple
-
 import requests
 from telegram import Update
 from telegram.constants import ChatAction
