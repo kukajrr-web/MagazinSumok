@@ -1,0 +1,22 @@
+{
+  "items": [
+    {
+      "id": "ArianaClassic",
+      "name": "Ariana Classic",
+      "price_kzt": 45000,
+      "colors": ["чёрный", "бежевый", "коричневый"],
+      "description": "Классическая сумка на плечо среднего размера.",
+      "keywords": ["ariana", "classic", "классика", "плечо"],
+      "photo_file_ids": []
+    },
+    {
+      "id": "BellaMini",
+      "name": "Bella Mini",
+      "price_kzt": 32000,
+      "colors": ["чёрный", "белый"],
+      "description": "Компактная кроссбоди для повседневных образов.",
+      "keywords": ["bella", "mini", "кроссбоди"],
+      "photo_file_ids": []
+    }
+  ]
+}
