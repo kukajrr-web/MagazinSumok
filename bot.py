@@ -1,563 +1,826 @@
+# bot.py
+# PTB (python-telegram-bot) async bot
+# UseAI demo bot for bag shop: natural dialog + optional AI + RU/KZ + clean UX (no big keyboard spam)
+
 import os
 import re
 import json
+import time
+import base64
 import logging
-from datetime import datetime
-from typing import Dict, Any, Optional
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, List
 
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ChatAction
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from telegram.ext import (
     ApplicationBuilder,
-    ContextTypes,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
     filters,
 )
 
-# -------------------- ENV --------------------
-load_dotenv()
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
-OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-ADMIN_ID = int((os.getenv("ADMIN_ID") or "0").strip() or "0")
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN is not set")
-
-# -------------------- LOGGING --------------------
+# ---------------------------
+# LOGGING
+# ---------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("bags-ai-demo")
+log = logging.getLogger("magazin-sumok-bot")
 
-# -------------------- CATALOG (DEMO) --------------------
-CATALOG: Dict[str, Dict[str, Any]] = {
-    "luna_mini": {
-        "name": "Luna Mini",
-        "price": 32900,
-        "colors": ["чёрный", "бежевый"],
-        "desc": "Компактная структурированная сумка, золотая фурнитура, минимализм.",
+# ---------------------------
+# ENV
+# ---------------------------
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()  # optional
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}  # optional
+
+# Storage files (simple JSON for demo)
+CATALOG_FILE = "catalog.json"
+LEADS_FILE = "leads.json"
+
+# ---------------------------
+# STATES
+# ---------------------------
+STATE_NONE = "NONE"
+STATE_WAIT_PHOTO_OR_MODEL = "WAIT_PHOTO_OR_MODEL"
+STATE_ORDER_CITY = "ORDER_CITY"
+STATE_ORDER_PHONE = "ORDER_PHONE"
+STATE_ORDER_DETAILS = "ORDER_DETAILS"
+STATE_WAIT_MANAGER_MSG = "WAIT_MANAGER_MSG"
+
+# ---------------------------
+# TEXTS RU/KZ
+# ---------------------------
+TXT = {
+    "ru": {
+        "start_hi": (
+            "Здравствуйте! 👋 Я AI-менеджер магазина сумок.\n"
+            "Чем могу помочь?\n\n"
+            "• Узнать цену (можно фото)\n"
+            "• Подобрать похожую модель\n"
+            "• Оформить заказ / доставка\n\n"
+            "Напишите запрос одним сообщением или отправьте фото."
+        ),
+        "choose_lang": "Выберите язык / Тілді таңдаңыз:",
+        "menu_title": "Меню:",
+        "menu_hint": "Если хотите — напишите запрос текстом (без кнопок тоже можно).",
+        "ask_photo_or_model": "Ок 👍 Отправьте фото сумки или напишите *название модели* (например: “Sofia Mini”).",
+        "ask_city": "Отлично. Напишите ваш *город*:",
+        "ask_phone": "Спасибо. Напишите ваш номер телефона (пример: +7 777 123 45 67):",
+        "ask_details": "Коротко уточните: модель/цвет/кол-во + адрес (если доставка) или “самовывоз”.",
+        "lead_done": "Заявка принята ✅ Менеджер скоро ответит.\nХотите открыть меню?",
+        "manager": "Напишите сообщение — я передам менеджеру.",
+        "delivery": "Доставка: по городу 1–2 дня. Самовывоз — по адресу магазина. Хотите оформить заказ?",
+        "catalog_empty": "Каталог пока пуст. Добавьте товары через /admin (для демо).",
+        "catalog_list": "Каталог (демо):",
+        "unknown": "Понял. Уточните, пожалуйста: вам *цена*, *подбор* или *заказ/доставка*? Можно фото.",
+        "no_ai": "AI-режим сейчас выключен (нет ключа). Я всё равно могу помочь по каталогу и оформить заявку.",
+        "ai_fail": "Я не смог корректно обработать запрос. Попробуйте: фото + коротко что нужно (цена/подбор/заказ).",
+        "price_result": "Нашёл вариант:\n{card}\n\nХотите оформить заказ?",
+        "not_found": "Пока не нашёл точное совпадение. Уточните модель/цвет/размер или пришлите фото ближе.",
+        "confirm_menu": "Меню",
+        "btn_price": "💰 Узнать цену",
+        "btn_catalog": "📦 Каталог",
+        "btn_delivery": "🚚 Доставка",
+        "btn_order": "🧾 Оформить заказ",
+        "btn_manager": "👤 Менеджер",
+        "btn_lang": "🌐 Язык",
+        "lang_set_ru": "Готово ✅ Язык: Русский",
+        "lang_set_kz": "Дайын ✅ Тіл: Қазақша",
+        "admin_only": "Только для админа.",
+        "admin_help": (
+            "Админ команды:\n"
+            "/admin — подсказка\n"
+            "/add — добавить товар (затем пришлите: название|цена|цвета через запятую|описание)\n"
+            "/setphoto — затем пришлите фото (привяжется к последнему товару)\n"
+            "/clear — очистить каталог (осторожно)\n"
+        ),
+        "admin_add_format": "Отправьте строку формата:\nНазвание|Цена|Цвета через запятую|Описание",
+        "admin_added": "Товар добавлен ✅ Теперь можно /setphoto и отправить фото (по желанию).",
+        "admin_photo_set": "Фото сохранено и привязано ✅",
+        "admin_cleared": "Каталог очищен ✅",
     },
-    "aura": {
-        "name": "AURA",
-        "price": 45900,
-        "colors": ["чёрный", "молочный"],
-        "desc": "Строгая форма, премиальный стиль, мягкая кожа.",
-    },
-    "vera": {
-        "name": "Vera",
-        "price": 38900,
-        "colors": ["шоколад", "чёрный"],
-        "desc": "Вместительная повседневная модель, универсальный дизайн.",
-    },
-    "nova": {
-        "name": "NOVA Premium",
-        "price": 51900,
-        "colors": ["чёрный"],
-        "desc": "Премиальная линейка, плотная форма, выглядит дороже остальных.",
-    },
-    "iris": {
-        "name": "Iris",
-        "price": 29900,
-        "colors": ["серый", "чёрный"],
-        "desc": "Лёгкая базовая сумка на каждый день, отличный вариант на подарок.",
-    },
+    "kz": {
+        "start_hi": (
+            "Сәлеметсіз бе! 👋 Мен сөмкелер дүкенінің AI-менеджерімін.\n"
+            "Қалай көмектесейін?\n\n"
+            "• Бағасын айту (фото жіберуге болады)\n"
+            "• Ұқсас модель таңдау\n"
+            "• Тапсырыс рәсімдеу / жеткізу\n\n"
+            "Бір хабарлама жазыңыз немесе фото жіберіңіз."
+        ),
+        "choose_lang": "Тілді таңдаңыз / Выберите язык:",
+        "menu_title": "Мәзір:",
+        "menu_hint": "Қаласаңыз — мәтінмен жазыңыз (батырмасыз да болады).",
+        "ask_photo_or_model": "Жақсы 👍 Сөмкенің фотосын жіберіңіз немесе *модель атауын* жазыңыз.",
+        "ask_city": "Керемет. *Қалаңызды* жазыңыз:",
+        "ask_phone": "Рақмет. Телефон нөміріңізді жазыңыз (мысалы: +7 777 123 45 67):",
+        "ask_details": "Қысқаша: модель/түс/саны + мекенжай (жеткізу болса) немесе “самовывоз”.",
+        "lead_done": "Өтінім қабылданды ✅ Менеджер жақында жауап береді.\nМәзір ашайық па?",
+        "manager": "Хабарлама жазыңыз — менеджерге жіберемін.",
+        "delivery": "Жеткізу: қала ішінде 1–2 күн. Самовывоз — дүкен мекенжайынан. Тапсырыс бересіз бе?",
+        "catalog_empty": "Каталог әзірге бос. Демо үшін /admin арқылы қосыңыз.",
+        "catalog_list": "Каталог (демо):",
+        "unknown": "Түсіндім. Нақтылаңызшы: *баға*, *таңдау* немесе *тапсырыс/жеткізу* керек пе? Фото да болады.",
+        "no_ai": "AI режимі өшірулі (кілт жоқ). Каталогпен және тапсырыспен көмектесемін.",
+        "ai_fail": "Сұранысты дұрыс өңдей алмадым. Фото + қысқа түрде жазыңыз (баға/таңдау/тапсырыс).",
+        "price_result": "Вариант таптым:\n{card}\n\nТапсырыс рәсімдейміз бе?",
+        "not_found": "Дәл сәйкестік таппадым. Модель/түс/өлшемді нақтылаңыз немесе анық фото жіберіңіз.",
+        "confirm_menu": "Мәзір",
+        "btn_price": "💰 Бағасын білу",
+        "btn_catalog": "📦 Каталог",
+        "btn_delivery": "🚚 Жеткізу",
+        "btn_order": "🧾 Тапсырыс",
+        "btn_manager": "👤 Менеджер",
+        "btn_lang": "🌐 Тіл",
+        "lang_set_ru": "Готово ✅ Язык: Русский",
+        "lang_set_kz": "Дайын ✅ Тіл: Қазақша",
+        "admin_only": "Тек админге.",
+        "admin_help": (
+            "Админ командалар:\n"
+            "/admin — көмек\n"
+            "/add — тауар қосу (кейін: атауы|бағасы|түстер|сипаттама)\n"
+            "/setphoto — кейін фото жіберіңіз (соңғы тауарға)\n"
+            "/clear — каталогты тазалау\n"
+        ),
+        "admin_add_format": "Мына форматта жіберіңіз:\nАтауы|Бағасы|Түстер(үтір арқылы)|Сипаттама",
+        "admin_added": "Тауар қосылды ✅ Қаласаңыз /setphoto жасап, фото жіберіңіз.",
+        "admin_photo_set": "Фото сақталды ✅",
+        "admin_cleared": "Каталог тазаланды ✅",
+    }
 }
 
-# -------------------- STORAGE: demo photo mapping --------------------
-DEMO_PHOTOS_FILE = "demo_photos.json"
-PHOTO_MODEL_MAP: Dict[str, str] = {}  # file_id -> model_key
-
-def load_demo_map() -> None:
-    global PHOTO_MODEL_MAP
+# ---------------------------
+# SIMPLE STORAGE
+# ---------------------------
+def load_json(path: str, default):
     try:
-        with open(DEMO_PHOTOS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            PHOTO_MODEL_MAP = {str(k): str(v) for k, v in data.items()}
-            logger.info("Loaded demo photo map: %d entries", len(PHOTO_MODEL_MAP))
-    except FileNotFoundError:
-        PHOTO_MODEL_MAP = {}
-    except Exception as e:
-        logger.warning("Failed to load demo map: %s", e)
-        PHOTO_MODEL_MAP = {}
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
-def save_demo_map() -> None:
-    try:
-        with open(DEMO_PHOTOS_FILE, "w", encoding="utf-8") as f:
-            json.dump(PHOTO_MODEL_MAP, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning("Failed to save demo map: %s", e)
+def save_json(path: str, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-# -------------------- UI --------------------
-def kb_main() -> InlineKeyboardMarkup:
+def ensure_storage():
+    if not os.path.exists(CATALOG_FILE):
+        save_json(CATALOG_FILE, {"items": [], "last_id": 0})
+    if not os.path.exists(LEADS_FILE):
+        save_json(LEADS_FILE, {"leads": []})
+
+# Catalog item structure:
+# {id, name, price, colors[], desc, photo_file_id(optional)}
+def catalog_add(name: str, price: str, colors: List[str], desc: str) -> Dict[str, Any]:
+    db = load_json(CATALOG_FILE, {"items": [], "last_id": 0})
+    db["last_id"] = int(db.get("last_id", 0)) + 1
+    item = {
+        "id": db["last_id"],
+        "name": name.strip(),
+        "price": price.strip(),
+        "colors": [c.strip() for c in colors if c.strip()],
+        "desc": desc.strip(),
+        "photo_file_id": None,
+    }
+    db["items"].append(item)
+    save_json(CATALOG_FILE, db)
+    return item
+
+def catalog_set_photo(item_id: int, file_id: str) -> bool:
+    db = load_json(CATALOG_FILE, {"items": [], "last_id": 0})
+    for it in db["items"]:
+        if it["id"] == item_id:
+            it["photo_file_id"] = file_id
+            save_json(CATALOG_FILE, db)
+            return True
+    return False
+
+def catalog_clear():
+    save_json(CATALOG_FILE, {"items": [], "last_id": 0})
+
+def catalog_list() -> List[Dict[str, Any]]:
+    db = load_json(CATALOG_FILE, {"items": [], "last_id": 0})
+    return db.get("items", [])
+
+def add_lead(data: Dict[str, Any]):
+    db = load_json(LEADS_FILE, {"leads": []})
+    db["leads"].append(data)
+    save_json(LEADS_FILE, db)
+
+# ---------------------------
+# UI
+# ---------------------------
+def kb_lang() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👜 Узнать цену", callback_data="price")],
-        [InlineKeyboardButton("📦 Каталог", callback_data="catalog")],
-        [InlineKeyboardButton("🚚 Доставка", callback_data="delivery")],
-        [InlineKeyboardButton("📝 Оформить заказ", callback_data="order")],
-        [InlineKeyboardButton("👩‍💼 Менеджер", callback_data="manager")],
+        [InlineKeyboardButton("Русский 🇷🇺", callback_data="lang:ru"),
+         InlineKeyboardButton("Қазақша 🇰🇿", callback_data="lang:kz")]
     ])
 
-def kb_catalog() -> InlineKeyboardMarkup:
-    rows = []
-    for k, item in CATALOG.items():
-        rows.append([InlineKeyboardButton(f"{item['name']} — {item['price']} ₸", callback_data=f"item:{k}")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
-    return InlineKeyboardMarkup(rows)
-
-def kb_item(model_key: str) -> InlineKeyboardMarkup:
+def kb_main(lang: str) -> InlineKeyboardMarkup:
+    t = TXT[lang]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Оформить заказ", callback_data=f"order:{model_key}")],
-        [InlineKeyboardButton("📦 Каталог", callback_data="catalog")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back")],
+        [InlineKeyboardButton(t["btn_price"], callback_data="act:price")],
+        [InlineKeyboardButton(t["btn_catalog"], callback_data="act:catalog"),
+         InlineKeyboardButton(t["btn_delivery"], callback_data="act:delivery")],
+        [InlineKeyboardButton(t["btn_order"], callback_data="act:order")],
+        [InlineKeyboardButton(t["btn_manager"], callback_data="act:manager"),
+         InlineKeyboardButton(t["btn_lang"], callback_data="act:lang")],
     ])
 
-def kb_demo_models() -> InlineKeyboardMarkup:
-    rows = []
-    for k, item in CATALOG.items():
-        rows.append([InlineKeyboardButton(item["name"], callback_data=f"demo_set:{k}")])
-    rows.append([InlineKeyboardButton("⬅️ Закрыть", callback_data="demo_cancel")])
-    return InlineKeyboardMarkup(rows)
+def kb_small_menu(lang: str) -> InlineKeyboardMarkup:
+    t = TXT[lang]
+    return InlineKeyboardMarkup([[InlineKeyboardButton(t["confirm_menu"], callback_data="act:menu")]])
 
-# -------------------- HELPERS --------------------
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID and user_id == ADMIN_ID
+def user_lang(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.user_data.get("lang") or "ru"
 
-def normalize_phone(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r"[^\d+]", "", s)
-    return s
-
-def digits_only(s: str) -> str:
-    return re.sub(r"\D", "", s or "")
-
-def find_model_from_text(text: str) -> Optional[str]:
-    t = (text or "").lower().strip()
-    if not t:
-        return None
-    # exact contains
-    for k, item in CATALOG.items():
-        if item["name"].lower() in t:
-            return k
-    # partial by words
-    words = [w for w in re.split(r"\s+", t) if w]
-    for k, item in CATALOG.items():
-        name = item["name"].lower()
-        if any(w in name for w in words):
-            return k
-    return None
-
-def catalog_brief() -> str:
-    lines = []
-    for k, item in CATALOG.items():
-        lines.append(f"- {item['name']}: {item['price']} ₸ (цвета: {', '.join(item['colors'])})")
-    return "\n".join(lines)
-
-# -------------------- AI (OpenAI) --------------------
-# Мы используем ИИ для консультаций по тексту, но НЕ для цен и фактов из каталога.
-# Если ИИ не доступен, бот работает как обычный менеджер.
-SYSTEM_PROMPT = (
-    "Ты — AI-менеджер магазина сумок. Пиши по-русски.\n"
-    "Цель: помочь выбрать модель, назвать цену/цвета из каталога и довести до заявки.\n"
-    "ЖЁСТКИЕ ПРАВИЛА:\n"
-    "1) Никогда не придумывай цену/наличие/скидки/условия доставки. Используй только данные каталога.\n"
-    "2) Если модель не ясна — попроси уточнить или предложи выбрать из каталога.\n"
-    "3) На странные сообщения отвечай спокойно и возвращай к делу.\n"
-    "4) Пиши коротко: 1–5 строк, без Markdown и без спецсимволов форматирования.\n"
-    "5) Всегда предлагай следующий шаг: выбрать модель, прислать фото, оформить заказ.\n"
-)
-
-async def ask_ai(text: str) -> str:
-    if not OPENAI_API_KEY:
-        # Фолбэк без ИИ
-        return (
-            "Могу подсказать цену и помочь с выбором.\n"
-            "Напишите модель или отправьте фото, либо откройте каталог."
-        )
-
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-
-        user_msg = (
-            f"Сообщение клиента: {text}\n\n"
-            f"Каталог:\n{catalog_brief()}\n\n"
-            "Ответь как менеджер. Если клиент спрашивает цену — назови цену только если модель ясна."
-        )
-
-        # “typing…”
-        # (действие показываем в обработчике, здесь не трогаем update)
-
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.4,
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        # страховка от пустого ответа
-        if not out:
-            out = "Уточните, пожалуйста, модель или пришлите фото — назову точную цену."
-        # убираем возможные лишние тройные кавычки/кодблоки
-        out = out.replace("```", "").strip()
-        return out
-    except Exception as e:
-        logger.warning("AI error: %s", e)
-        return (
-            "Сейчас могу подсказать цену и помочь с выбором.\n"
-            "Напишите модель или отправьте фото, либо откройте каталог."
-        )
-
-# -------------------- STATE (manual, stable) --------------------
-# Мы не используем ConversationHandler — поэтому НЕ будет зависаний.
-# Всё держим в context.user_data["state"].
-STATE_NONE = "NONE"
-STATE_WAIT_MODEL = "WAIT_MODEL"
-STATE_WAIT_CITY = "WAIT_CITY"
-STATE_WAIT_PHONE = "WAIT_PHONE"
-STATE_DEMO_WAIT_PHOTO = "DEMO_WAIT_PHOTO"
-
-def set_state(context: ContextTypes.DEFAULT_TYPE, st: str) -> None:
+def set_state(context: ContextTypes.DEFAULT_TYPE, st: str):
     context.user_data["state"] = st
 
 def get_state(context: ContextTypes.DEFAULT_TYPE) -> str:
     return context.user_data.get("state", STATE_NONE)
 
-# -------------------- HANDLERS --------------------
+# ---------------------------
+# INTENT DETECTION (no-AI fallback)
+# ---------------------------
+def detect_intent(text: str) -> str:
+    t = (text or "").lower().strip()
+    if not t:
+        return "CHAT"
+    if any(x in t for x in ["меню", "menu", "мәзір"]):
+        return "MENU"
+    if any(x in t for x in ["цена", "сколько", "стоимость", "почем", "баға", "қанша"]):
+        return "PRICE"
+    if any(x in t for x in ["каталог", "модели", "ассортимент", "catalog"]):
+        return "CATALOG"
+    if any(x in t for x in ["доставка", "привез", "курьер", "жеткіз", "delivery"]):
+        return "DELIVERY"
+    if any(x in t for x in ["заказ", "купить", "оформ", "тапсырыс", "сатып"]):
+        return "ORDER"
+    if any(x in t for x in ["менеджер", "оператор", "адам", "manager"]):
+        return "MANAGER"
+    return "CHAT"
+
+def normalize_phone(s: str) -> Optional[str]:
+    digits = re.sub(r"[^\d+]", "", s.strip())
+    # simple accept +7 / 7 / 8 formats
+    d = re.sub(r"[^\d]", "", digits)
+    if len(d) < 10:
+        return None
+    # format to +7XXXXXXXXXX if looks like KZ/RU
+    if d.startswith("8") and len(d) == 11:
+        d = "7" + d[1:]
+    if d.startswith("7") and len(d) == 11:
+        return "+" + d
+    if len(d) == 10:
+        return "+7" + d
+    return "+" + d
+
+def find_by_text(query: str) -> Optional[Dict[str, Any]]:
+    q = (query or "").lower().strip()
+    if not q:
+        return None
+    items = catalog_list()
+    # direct contains
+    for it in items:
+        if it["name"].lower() in q or q in it["name"].lower():
+            return it
+    # token overlap
+    q_tokens = set(re.findall(r"[a-zа-я0-9]+", q))
+    best = None
+    best_score = 0
+    for it in items:
+        it_tokens = set(re.findall(r"[a-zа-я0-9]+", it["name"].lower()))
+        score = len(q_tokens & it_tokens)
+        if score > best_score:
+            best_score = score
+            best = it
+    if best_score >= 1:
+        return best
+    return None
+
+def format_item_card(it: Dict[str, Any], lang: str) -> str:
+    if lang == "kz":
+        colors = ", ".join(it.get("colors") or []) or "—"
+        return f"👜 {it['name']}\n💰 Бағасы: {it['price']}\n🎨 Түстер: {colors}\nℹ️ {it.get('desc','')}"
+    colors = ", ".join(it.get("colors") or []) or "—"
+    return f"👜 {it['name']}\n💰 Цена: {it['price']}\n🎨 Цвета: {colors}\nℹ️ {it.get('desc','')}"
+
+# ---------------------------
+# OPTIONAL AI (OpenAI) — safe concierge + matching by photo/text
+# ---------------------------
+async def ai_answer_text(prompt: str) -> Optional[str]:
+    """
+    Minimal OpenAI call without extra deps.
+    Uses requests-like via urllib to avoid requirements changes.
+    Works on Railway/Beget if outbound allowed.
+    """
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        import urllib.request
+
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "You are a helpful sales assistant for a bag shop. Reply briefly and politely."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+        }
+
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8")
+        j = json.loads(raw)
+        return j["choices"][0]["message"]["content"]
+    except Exception as e:
+        log.warning("AI text call failed: %s", e)
+        return None
+
+async def ai_match_by_photo_or_text(lang: str, text_query: str, image_b64: Optional[str]) -> Dict[str, Any]:
+    """
+    Returns dict:
+      {type: "match", item: {...}, confidence: float, notes: str}
+      or {type: "clarify", questions: "..."}
+      or {type: "no_match"}
+    """
+    items = catalog_list()
+    if not items:
+        return {"type": "no_match"}
+
+    # If no AI, fallback to text match only
+    if not OPENAI_API_KEY:
+        it = find_by_text(text_query)
+        if it:
+            return {"type": "match", "item": it, "confidence": 0.75, "notes": "text"}
+        return {"type": "no_match"}
+
+    # Build compact catalog context (names, prices, colors)
+    catalog_context = []
+    for it in items[:30]:
+        catalog_context.append({
+            "id": it["id"],
+            "name": it["name"],
+            "price": it["price"],
+            "colors": it.get("colors", []),
+            "desc": it.get("desc", ""),
+        })
+
+    # Prompt: force choose best match only if sure, else clarify
+    if lang == "kz":
+        user_inst = (
+            "Сен сөмке дүкенінің менеджерісің. Мақсат: клиенттің мәтіні/фотосы бойынша каталогтағы нақты модельді табу.\n"
+            "Ережелер:\n"
+            "1) Егер сенімділік >= 0.85 болса — тек бір модельді таңда.\n"
+            "2) Егер сенімділік төмен болса — нақтылау сұрақтарын қой (2-3 сұрақ).\n"
+            "3) Ойдан шығарма. Каталогта жоқ модельді 'бар' деп айтпа.\n"
+            "Жауапты қатаң JSON түрінде бер:\n"
+            '{"action":"match|clarify|no_match","id":number|null,"confidence":0..1,"questions":"string","reason":"string"}'
+        )
+    else:
+        user_inst = (
+            "You are a bag shop manager. Goal: match customer's text/photo to an exact model from our catalog.\n"
+            "Rules:\n"
+            "1) If confidence >= 0.85 — choose exactly one model.\n"
+            "2) If lower — ask 2-3 clarifying questions.\n"
+            "3) Never invent. If not in catalog, say no_match.\n"
+            "Return STRICT JSON only:\n"
+            '{"action":"match|clarify|no_match","id":number|null,"confidence":0..1,"questions":"string","reason":"string"}'
+        )
+
+    # Use OpenAI with image if provided (vision capable model)
+    try:
+        import urllib.request
+
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        user_content = [{"type": "text", "text": f"Catalog: {json.dumps(catalog_context, ensure_ascii=False)}\n\nCustomer text: {text_query or ''}"}]
+        if image_b64:
+            user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}})
+
+        body = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": user_inst},
+                {"role": "user", "content": user_content},
+            ],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+        }
+
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+        j = json.loads(raw)
+        content = j["choices"][0]["message"]["content"]
+        out = json.loads(content)
+
+        action = out.get("action")
+        if action == "match":
+            _id = out.get("id")
+            conf = float(out.get("confidence", 0))
+            chosen = next((x for x in items if x["id"] == _id), None)
+            if chosen and conf >= 0.85:
+                return {"type": "match", "item": chosen, "confidence": conf, "notes": out.get("reason", "")}
+            # if not enough confidence, clarify
+            return {"type": "clarify", "questions": out.get("questions", "") or "Уточните цвет/размер/фурнитуру?"}
+        if action == "clarify":
+            return {"type": "clarify", "questions": out.get("questions", "") or "Уточните модель/цвет/размер?"}
+        return {"type": "no_match"}
+    except Exception as e:
+        log.warning("AI match failed: %s", e)
+        # fallback text
+        it = find_by_text(text_query)
+        if it:
+            return {"type": "match", "item": it, "confidence": 0.75, "notes": "fallback"}
+        return {"type": "no_match"}
+
+# ---------------------------
+# HANDLERS
+# ---------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = user_lang(context)
     set_state(context, STATE_NONE)
-    context.user_data.pop("selected_model", None)
-    context.user_data.pop("order_city", None)
+    context.user_data["last_admin_item_id"] = None
+    await update.message.reply_text(TXT[lang]["choose_lang"], reply_markup=kb_lang())
+    # Important: remove big keyboards
+    await update.message.reply_text(" ", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(TXT[lang]["start_hi"], reply_markup=kb_small_menu(lang))
 
-    await update.message.reply_text(
-        "Здравствуйте! Я AI-менеджер магазина сумок 👜\n"
-        "Отправьте фото сумки или напишите, что вас интересует.\n\n"
-        "Можно выбрать действия кнопками:",
-        reply_markup=kb_main()
-    )
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Команды:\n"
-        "/start — начать\n"
-        "/demo — привязать демо-фото к модели (только админ)\n"
-        "/reset — сбросить состояние\n"
-    )
-
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = user_lang(context)
     set_state(context, STATE_NONE)
-    context.user_data.pop("selected_model", None)
-    context.user_data.pop("order_city", None)
-    context.user_data.pop("demo_model_key", None)
-    await update.message.reply_text("Сбросил. Открываю меню:", reply_markup=kb_main())
+    await update.message.reply_text(TXT[lang]["menu_title"], reply_markup=kb_main(lang))
+    await update.message.reply_text(TXT[lang]["menu_hint"])
 
-async def cmd_demo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("Команда доступна только администратору.")
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        lang = user_lang(context)
+        await update.message.reply_text(TXT[lang]["admin_only"])
         return
-    set_state(context, STATE_NONE)
-    context.user_data.pop("demo_model_key", None)
+    lang = user_lang(context)
+    await update.message.reply_text(TXT[lang]["admin_help"])
 
-    await update.message.reply_text(
-        "ДЕМО: выберите модель, к которой привяжем следующее фото:",
-        reply_markup=kb_demo_models()
-    )
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        lang = user_lang(context)
+        await update.message.reply_text(TXT[lang]["admin_only"])
+        return
+    lang = user_lang(context)
+    context.user_data["admin_wait_add"] = True
+    await update.message.reply_text(TXT[lang]["admin_add_format"])
+
+async def cmd_setphoto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        lang = user_lang(context)
+        await update.message.reply_text(TXT[lang]["admin_only"])
+        return
+    context.user_data["admin_wait_photo"] = True
+    lang = user_lang(context)
+    await update.message.reply_text("Ок. Теперь пришлите фото товара одним сообщением.")
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        lang = user_lang(context)
+        await update.message.reply_text(TXT[lang]["admin_only"])
+        return
+    catalog_clear()
+    lang = user_lang(context)
+    await update.message.reply_text(TXT[lang]["admin_cleared"])
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     data = q.data or ""
+    if data.startswith("lang:"):
+        lang = data.split(":", 1)[1]
+        context.user_data["lang"] = "kz" if lang == "kz" else "ru"
+        if lang == "kz":
+            await q.message.reply_text(TXT["kz"]["lang_set_kz"], reply_markup=kb_small_menu("kz"))
+        else:
+            await q.message.reply_text(TXT["ru"]["lang_set_ru"], reply_markup=kb_small_menu("ru"))
+        return
 
-    if data == "back":
+    lang = user_lang(context)
+
+    if data == "act:menu":
         set_state(context, STATE_NONE)
-        await q.message.reply_text("Главное меню:", reply_markup=kb_main())
+        await q.message.reply_text(TXT[lang]["menu_title"], reply_markup=kb_main(lang))
         return
 
-    if data == "price":
-        set_state(context, STATE_WAIT_MODEL)
-        await q.message.reply_text(
-            "Напишите название модели или отправьте фото.\n"
-            "Если удобнее — откройте каталог и выберите модель.",
-            reply_markup=kb_catalog()
-        )
+    if data == "act:lang":
+        await q.message.reply_text(TXT[lang]["choose_lang"], reply_markup=kb_lang())
         return
 
-    if data == "catalog":
-        set_state(context, STATE_NONE)
-        await q.message.reply_text("Каталог:", reply_markup=kb_catalog())
+    if data == "act:price":
+        set_state(context, STATE_WAIT_PHOTO_OR_MODEL)
+        await q.message.reply_text(TXT[lang]["ask_photo_or_model"])
         return
 
-    if data == "delivery":
-        set_state(context, STATE_NONE)
-        await q.message.reply_text(
-            "Доставка:\n"
-            "• По городу: 1–2 дня\n"
-            "• По Казахстану: 2–5 дней\n"
-            "Точные условия уточнит менеджер после заявки.",
-            reply_markup=kb_main()
-        )
-        return
-
-    if data == "manager":
-        set_state(context, STATE_NONE)
-        await q.message.reply_text(
-            "Могу подключить менеджера.\n"
-            "Оформите заявку: выберите модель → город → телефон.",
-            reply_markup=kb_main()
-        )
-        return
-
-    if data == "order":
-        # заказ без модели — попросим выбрать
-        set_state(context, STATE_WAIT_MODEL)
-        await q.message.reply_text(
-            "Чтобы оформить заказ, сначала выберите модель из каталога или отправьте фото:",
-            reply_markup=kb_catalog()
-        )
-        return
-
-    if data.startswith("item:"):
-        model_key = data.split(":", 1)[1]
-        item = CATALOG.get(model_key)
-        if not item:
-            await q.message.reply_text("Модель не найдена.", reply_markup=kb_main())
+    if data == "act:catalog":
+        items = catalog_list()
+        if not items:
+            await q.message.reply_text(TXT[lang]["catalog_empty"], reply_markup=kb_small_menu(lang))
             return
+        lines = [TXT[lang]["catalog_list"]]
+        for it in items[:12]:
+            lines.append(f"• {it['name']} — {it['price']}")
+        await q.message.reply_text("\n".join(lines), reply_markup=kb_small_menu(lang))
+        return
 
-        context.user_data["selected_model"] = model_key
+    if data == "act:delivery":
         set_state(context, STATE_NONE)
-
-        await q.message.reply_text(
-            f"Модель: {item['name']} 👜\n"
-            f"Цена: {item['price']} ₸\n"
-            f"Цвета: {', '.join(item['colors'])}\n"
-            f"Описание: {item['desc']}\n\n"
-            "Оформляем заказ?",
-            reply_markup=kb_item(model_key)
-        )
+        await q.message.reply_text(TXT[lang]["delivery"], reply_markup=kb_small_menu(lang))
         return
 
-    if data.startswith("order:"):
-        model_key = data.split(":", 1)[1]
-        if model_key not in CATALOG:
-            await q.message.reply_text("Модель не найдена.", reply_markup=kb_main())
-            return
-        context.user_data["selected_model"] = model_key
-        set_state(context, STATE_WAIT_CITY)
-        await q.message.reply_text("Отлично! Напишите ваш город:")
+    if data == "act:order":
+        set_state(context, STATE_ORDER_CITY)
+        await q.message.reply_text(TXT[lang]["ask_city"])
         return
 
-    # DEMO buttons
-    if data == "demo_cancel":
-        set_state(context, STATE_NONE)
-        context.user_data.pop("demo_model_key", None)
-        await q.message.reply_text("Ок, закрыл демо-режим.", reply_markup=kb_main())
+    if data == "act:manager":
+        set_state(context, STATE_WAIT_MANAGER_MSG)
+        await q.message.reply_text(TXT[lang]["manager"])
         return
 
-    if data.startswith("demo_set:"):
-        if not is_admin(update.effective_user.id):
-            await q.message.reply_text("Доступно только администратору.")
-            return
-        model_key = data.split(":", 1)[1]
-        if model_key not in CATALOG:
-            await q.message.reply_text("Не нашёл модель.")
-            return
-
-        context.user_data["demo_model_key"] = model_key
-        set_state(context, STATE_DEMO_WAIT_PHOTO)
-
-        await q.message.reply_text(
-            f"Теперь отправьте фото модели {CATALOG[model_key]['name']} 📸\n"
-            "Я привяжу фото к этой модели."
-        )
-        return
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    file_id = update.message.photo[-1].file_id
-
-    # 1) DEMO привязка (только админ)
-    if get_state(context) == STATE_DEMO_WAIT_PHOTO and is_admin(user_id):
-        model_key = context.user_data.get("demo_model_key")
-        if model_key and model_key in CATALOG:
-            PHOTO_MODEL_MAP[file_id] = model_key
-            save_demo_map()
-
-            set_state(context, STATE_NONE)
-            context.user_data.pop("demo_model_key", None)
-
-            await update.message.reply_text(
-                f"Готово ✅ Фото привязано к модели: {CATALOG[model_key]['name']}\n"
-                f"Всего привязок: {len(PHOTO_MODEL_MAP)}",
-                reply_markup=kb_main()
-            )
-            return
-
-    # 2) Распознавание (демо по file_id)
-    mapped_key = PHOTO_MODEL_MAP.get(file_id)
-    if mapped_key and mapped_key in CATALOG:
-        item = CATALOG[mapped_key]
-        context.user_data["selected_model"] = mapped_key
-
-        await update.message.reply_text(
-            f"Это модель {item['name']} 👜\n"
-            f"Цена: {item['price']} ₸\n"
-            f"В наличии цвета: {', '.join(item['colors'])}\n\n"
-            "Оформляем заказ?",
-            reply_markup=kb_item(mapped_key)
-        )
-        return
-
-    # 3) Неизвестное фото — ведём в каталог (без “похоже”)
-    set_state(context, STATE_WAIT_MODEL)
-    await update.message.reply_text(
-        "Эта модель есть в нашем каталоге.\n"
-        "Чтобы назвать точную цену, выберите модель из списка ниже или напишите название:",
-        reply_markup=kb_catalog()
-    )
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = user_lang(context)
     text = (update.message.text or "").strip()
-    if not text:
-        return
-
     st = get_state(context)
 
-    # Состояние: ждём город
-    if st == STATE_WAIT_CITY:
-        city = text.strip()
-        if len(city) < 2:
-            await update.message.reply_text("Напишите город текстом (например: Алматы):")
-            return
-        context.user_data["order_city"] = city
-        set_state(context, STATE_WAIT_PHONE)
-        await update.message.reply_text("Теперь отправьте номер телефона (пример: +7 777 123 45 67):")
+    # Admin add flow
+    if update.effective_user.id in ADMIN_IDS and context.user_data.get("admin_wait_add"):
+        # parse: name|price|colors|desc
+        parts = [p.strip() for p in text.split("|")]
+        if len(parts) >= 4:
+            name, price, colors, desc = parts[0], parts[1], parts[2], "|".join(parts[3:])
+            item = catalog_add(name, price, [c.strip() for c in colors.split(",")], desc)
+            context.user_data["admin_wait_add"] = False
+            context.user_data["last_admin_item_id"] = item["id"]
+            await update.message.reply_text(TXT[lang]["admin_added"])
+        else:
+            await update.message.reply_text(TXT[lang]["admin_add_format"])
         return
 
-    # Состояние: ждём телефон
-    if st == STATE_WAIT_PHONE:
+    # State machine
+    if st == STATE_ORDER_CITY:
+        context.user_data["order_city"] = text
+        set_state(context, STATE_ORDER_PHONE)
+        await update.message.reply_text(TXT[lang]["ask_phone"])
+        return
+
+    if st == STATE_ORDER_PHONE:
         phone = normalize_phone(text)
-        d = digits_only(phone)
-        if len(d) < 10:
-            await update.message.reply_text("Номер выглядит коротким. Отправьте ещё раз (пример: +7 777 123 45 67):")
+        if not phone:
+            await update.message.reply_text(TXT[lang]["ask_phone"])
             return
+        context.user_data["order_phone"] = phone
+        set_state(context, STATE_ORDER_DETAILS)
+        await update.message.reply_text(TXT[lang]["ask_details"])
+        return
 
-        model_key = context.user_data.get("selected_model")
-        city = context.user_data.get("order_city", "—")
-        item = CATALOG.get(model_key)
-
-        if not item:
-            # если вдруг модель не выбрана — вернём к каталогу
-            set_state(context, STATE_WAIT_MODEL)
-            await update.message.reply_text(
-                "Почти готово. Сначала выберите модель из каталога:",
-                reply_markup=kb_catalog()
-            )
-            return
-
-        # фиксируем заявку
-        order = {
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    if st == STATE_ORDER_DETAILS:
+        # save lead
+        lead = {
+            "ts": int(time.time()),
             "user_id": update.effective_user.id,
+            "username": update.effective_user.username,
             "name": update.effective_user.full_name,
-            "username": update.effective_user.username or "",
-            "city": city,
-            "phone": phone,
-            "model_key": model_key,
-            "model_name": item["name"],
-            "price": item["price"],
+            "city": context.user_data.get("order_city"),
+            "phone": context.user_data.get("order_phone"),
+            "details": text,
         }
-
+        add_lead(lead)
         set_state(context, STATE_NONE)
-        context.user_data.pop("order_city", None)
-
-        await update.message.reply_text(
-            "Заявка принята ✅\n"
-            "Менеджер скоро свяжется с вами.\n\n"
-            "Хотите посмотреть другие модели?",
-            reply_markup=kb_main()
-        )
-
-        # админу
-        if ADMIN_ID:
-            admin_text = (
-                "НОВАЯ ЗАЯВКА\n"
-                f"Время: {order['ts']}\n"
-                f"Клиент: {order['name']} (@{order['username']})\n"
-                f"Город: {order['city']}\n"
-                f"Телефон: {order['phone']}\n"
-                f"Товар: {order['model_name']} — {order['price']} ₸\n"
-                f"UserID: {order['user_id']}"
-            )
-            try:
-                await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text)
-            except Exception as e:
-                logger.warning("Admin notify failed: %s", e)
+        await update.message.reply_text(TXT[lang]["lead_done"], reply_markup=kb_small_menu(lang))
         return
 
-    # Состояние: ждём модель (по тексту)
-    if st == STATE_WAIT_MODEL:
-        key = find_model_from_text(text)
-        if key and key in CATALOG:
-            item = CATALOG[key]
-            context.user_data["selected_model"] = key
-            set_state(context, STATE_NONE)
+    if st == STATE_WAIT_MANAGER_MSG:
+        # Here you can forward to admin chat if you want (needs ADMIN_CHAT_ID)
+        lead = {
+            "ts": int(time.time()),
+            "user_id": update.effective_user.id,
+            "username": update.effective_user.username,
+            "name": update.effective_user.full_name,
+            "message_to_manager": text,
+        }
+        add_lead(lead)
+        set_state(context, STATE_NONE)
+        await update.message.reply_text(TXT[lang]["lead_done"], reply_markup=kb_small_menu(lang))
+        return
 
-            await update.message.reply_text(
-                f"Модель: {item['name']} 👜\n"
-                f"Цена: {item['price']} ₸\n"
-                f"Цвета: {', '.join(item['colors'])}\n\n"
-                "Оформляем заказ?",
-                reply_markup=kb_item(key)
-            )
+    # No active scenario → detect intent
+    intent = detect_intent(text)
+
+    if intent == "MENU":
+        await update.message.reply_text(TXT[lang]["menu_title"], reply_markup=kb_main(lang))
+        return
+
+    if intent == "PRICE":
+        set_state(context, STATE_WAIT_PHOTO_OR_MODEL)
+        await update.message.reply_text(TXT[lang]["ask_photo_or_model"])
+        return
+
+    if intent == "CATALOG":
+        items = catalog_list()
+        if not items:
+            await update.message.reply_text(TXT[lang]["catalog_empty"], reply_markup=kb_small_menu(lang))
+            return
+        lines = [TXT[lang]["catalog_list"]]
+        for it in items[:12]:
+            lines.append(f"• {it['name']} — {it['price']}")
+        await update.message.reply_text("\n".join(lines), reply_markup=kb_small_menu(lang))
+        return
+
+    if intent == "DELIVERY":
+        await update.message.reply_text(TXT[lang]["delivery"], reply_markup=kb_small_menu(lang))
+        return
+
+    if intent == "ORDER":
+        set_state(context, STATE_ORDER_CITY)
+        await update.message.reply_text(TXT[lang]["ask_city"])
+        return
+
+    if intent == "MANAGER":
+        set_state(context, STATE_WAIT_MANAGER_MSG)
+        await update.message.reply_text(TXT[lang]["manager"])
+        return
+
+    # Smart chat mode:
+    # If AI exists → answer gracefully as manager, but don't invent price/models.
+    if OPENAI_API_KEY:
+        prompt = (
+            "You are a store assistant for a bag shop.\n"
+            "If user asks for price/model, ask for photo or model name.\n"
+            "If user is rude or writes nonsense, reply calm and guide to next step.\n"
+            f"User message: {text}\n"
+            "Reply short in the user's language (Russian or Kazakh depending on the message)."
+        )
+        ans = await ai_answer_text(prompt)
+        if ans:
+            await update.message.reply_text(ans, reply_markup=kb_small_menu(lang))
             return
 
-        # если не нашли модель — подключаем ИИ (внутри ИИ тоже будет “выбери из каталога”)
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-        ai_reply = await ask_ai(text)
-        await update.message.reply_text(ai_reply, reply_markup=kb_main())
+    await update.message.reply_text(TXT[lang]["unknown"], reply_markup=kb_small_menu(lang))
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = user_lang(context)
+    st = get_state(context)
+
+    # Admin photo attach flow
+    if update.effective_user.id in ADMIN_IDS and context.user_data.get("admin_wait_photo"):
+        item_id = context.user_data.get("last_admin_item_id")
+        if not item_id:
+            await update.message.reply_text("Нет последнего товара. Сначала /add")
+            return
+        file_id = update.message.photo[-1].file_id
+        ok = catalog_set_photo(item_id, file_id)
+        context.user_data["admin_wait_photo"] = False
+        if ok:
+            await update.message.reply_text(TXT[lang]["admin_photo_set"])
+        else:
+            await update.message.reply_text("Не удалось привязать фото.")
         return
 
-    # Обычный режим: любой текст -> ИИ (или фолбэк)
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    ai_reply = await ask_ai(text)
-    await update.message.reply_text(ai_reply, reply_markup=kb_main())
+    # Client: photo for price/model
+    # We'll attempt AI match if possible, else ask for model name
+    if st not in [STATE_WAIT_PHOTO_OR_MODEL, STATE_NONE]:
+        # If in order flow, just accept photo as part of details
+        await update.message.reply_text(TXT[lang]["ask_details"])
+        return
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Unhandled error", exc_info=context.error)
-
-async def post_init(app):
-    # убираем webhook, чтобы не было Conflict
+    # Download photo as bytes → base64 for AI
+    image_b64 = None
     try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook deleted (drop_pending_updates=True)")
+        file = await context.bot.get_file(update.message.photo[-1].file_id)
+        b = await file.download_as_bytearray()
+        image_b64 = base64.b64encode(bytes(b)).decode("utf-8")
     except Exception as e:
-        logger.warning("delete_webhook failed: %s", e)
+        log.warning("Could not download photo: %s", e)
 
-# -------------------- MAIN --------------------
+    # AI match attempt
+    res = await ai_match_by_photo_or_text(lang=lang, text_query="", image_b64=image_b64)
+
+    if res["type"] == "match":
+        it = res["item"]
+        conf = float(res.get("confidence", 0))
+        card = format_item_card(it, lang)
+        # If confidence high → speak confidently; else ask confirm
+        if conf >= 0.90:
+            await update.message.reply_text(TXT[lang]["price_result"].format(card=card), reply_markup=kb_small_menu(lang))
+        else:
+            # Not "точно", ask confirmation
+            if lang == "kz":
+                msg = f"Мына модель болуы мүмкін (сенімділік {int(conf*100)}%):\n{card}\n\nДұрыс па? Дұрыстасаңыз — түсін/өлшемін жазыңыз."
+            else:
+                msg = f"Похоже на эту модель (уверенность {int(conf*100)}%):\n{card}\n\nЭто она? Если да — напишите цвет/размер."
+            await update.message.reply_text(msg, reply_markup=kb_small_menu(lang))
+        set_state(context, STATE_NONE)
+        return
+
+    if res["type"] == "clarify":
+        q = res.get("questions") or TXT[lang]["ask_photo_or_model"]
+        await update.message.reply_text(q, reply_markup=kb_small_menu(lang))
+        set_state(context, STATE_WAIT_PHOTO_OR_MODEL)
+        return
+
+    await update.message.reply_text(TXT[lang]["not_found"], reply_markup=kb_small_menu(lang))
+    set_state(context, STATE_WAIT_PHOTO_OR_MODEL)
+
+async def on_any_model_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    When we're explicitly waiting for model name, treat text as query.
+    """
+    lang = user_lang(context)
+    st = get_state(context)
+    if st != STATE_WAIT_PHOTO_OR_MODEL:
+        return
+
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text(TXT[lang]["ask_photo_or_model"])
+        return
+
+    # AI match by text (or fallback)
+    res = await ai_match_by_photo_or_text(lang=lang, text_query=text, image_b64=None)
+    if res["type"] == "match":
+        it = res["item"]
+        card = format_item_card(it, lang)
+        await update.message.reply_text(TXT[lang]["price_result"].format(card=card), reply_markup=kb_small_menu(lang))
+        set_state(context, STATE_NONE)
+        return
+
+    if res["type"] == "clarify":
+        await update.message.reply_text(res.get("questions") or TXT[lang]["ask_photo_or_model"], reply_markup=kb_small_menu(lang))
+        return
+
+    await update.message.reply_text(TXT[lang]["not_found"], reply_markup=kb_small_menu(lang))
+
+# ---------------------------
+# ERROR HANDLER
+# ---------------------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error: %s", context.error)
+
+# ---------------------------
+# MAIN
+# ---------------------------
 def main():
-    load_demo_map()
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN is empty. Set environment variable BOT_TOKEN.")
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+    ensure_storage()
 
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    # commands
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("demo", cmd_demo))
+    app.add_handler(CommandHandler("menu", cmd_menu))
 
+    # admin
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("setphoto", cmd_setphoto))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+
+    # callbacks
     app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    app.add_error_handler(error_handler)
+    # photos
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
 
-    logger.info("Bot started")
-    app.run_polling(drop_pending_updates=True)
+    # If waiting for model name → prioritize this handler
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_any_model_text), group=0)
+    # General text
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=1)
+
+    app.add_error_handler(on_error)
+
+    log.info("Bot started. AI=%s", "ON" if bool(OPENAI_API_KEY) else "OFF")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
+
